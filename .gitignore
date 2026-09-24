@@ -1,0 +1,47 @@
+# .gitignore da pasta "Claude Code".
+# Os padroes aqui sao propositalmente sem prefixo de projeto, porque este mesmo
+# arquivo e copiado pra dentro de cada projeto pelo _organizacao/git-setup.ps1.
+# Padrao sem barra no inicio casa em qualquer nivel — funciona nos dois lugares.
+
+# Dependencias e builds — nunca versionar (regra 5 do CLAUDE.md)
+node_modules/
+dist/
+build/
+.vite/
+__pycache__/
+*.pyc
+*.pyo
+
+# Bancos e artefatos de runtime
+*.db-wal
+*.db-shm
+*.sqlite-journal
+uploads/
+
+# Segredo — nunca, em hipotese alguma
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Material bruto de cliente: pesado e insubstituivel.
+# Fica FORA do git de proposito — backup disso e backup de arquivo, nao commit.
+_originais/
+
+# Quarentena, organizacao e projeto privado (valem na raiz)
+_REVISAR/
+_organizacao/*.log
+REPEAK/
+
+# Pacotes soltos (regra 4 do CLAUDE.md)
+*.zip
+*.rar
+*.7z
+
+# Lixo de sistema e editor
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+.vscode/

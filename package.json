@@ -1,0 +1,9 @@
+{
+  "name": "tanque-de-agua",
+  "private": true,
+  "type": "module",
+  "description": "Tanque de água 2D com física de fluido incompressível e paredes desenhadas à mão",
+  "scripts": {
+    "test": "node --test"
+  }
+}
