@@ -50,6 +50,7 @@ export class MotorGPU {
   static contextos = new Map();
 
   get h() { return this.cena.h; }
+  get maxParticulas() { return this.fisica.maxParticulas; }
   /** Maior velocidade da água no último quadro medido (m/s), ou null. */
   get vMax() { return this.fisica.vMax; }
   paredesMudaram() { this.fisica.subirParedes(); }
@@ -62,7 +63,11 @@ export class MotorGPU {
     this.fisica.quadro(enc, dt, subpassos, ferramenta);
     this.render.desenhar(enc, this.fisica, this.canvas.width, this.canvas.height);
     this.device.queue.submit([enc.finish()]);
+    this.fisica.aposEnviar();
   }
+
+  /** Milissegundos de GPU por subpasso (null se a placa não mede). */
+  get custoPorSubpasso() { return this.fisica.custoPorSubpasso; }
 
   contagem() { return this.fisica.lerContagem(); }
   particulas() { return this.fisica.lerParticulas(); }
@@ -83,24 +88,31 @@ export class MotorCPU {
   }
 
   get h() { return this.cena.h; }
+  get maxParticulas() { return Math.ceil(this.sim.nx * this.sim.ny * PARTICULAS_MAX_POR_CELULA); }
   get vMax() { return this.sim.vMax ?? null; }
   paredesMudaram() { this.sim.atualizarParedes(); }
   adicionar(lista, checar = true) { this.pendentes.push([lista, checar]); }
-  limparAgua() { this.sim.n = 0; this.pendentes = []; this.sim.contagemCelula.fill(0); }
+  limparAgua() { this.sim.n = 0; this.pendentes = []; this.sim.contagemCelula.fill(0); this.sim.reiniciarAr(); }
   set gravidade(g) { this.sim.gravidade = g; }
 
   quadro(dt, subpassos, ferramenta) {
     this.sim.aplicarFerramenta(ferramenta);
-    const teto = Math.ceil(this.sim.nx * this.sim.ny * PARTICULAS_MAX_POR_CELULA);
+    const teto = this.maxParticulas;
     for (const [l, c] of this.pendentes) {
       const cabe = Math.max(0, teto - this.sim.n) * CAMPOS;
       if (cabe > 0) this.sim.adicionar(l.length > cabe ? l.subarray(0, cabe) : l, c);
     }
     this.pendentes = [];
-    if (subpassos > 0) this.sim.avancar(dt, subpassos);
+    if (subpassos > 0) {
+      const t0 = performance.now();
+      this.sim.avancar(dt, subpassos);
+      const ms = (performance.now() - t0) / subpassos;
+      this.custoCpu = this.custoCpu == null ? ms : this.custoCpu + (ms - this.custoCpu) * 0.2;
+    }
     this.render.desenhar(this.sim);
   }
 
+  get custoPorSubpasso() { return this.custoCpu ?? null; }
   async contagem() { return this.sim.n; }
   async particulas() { return this.sim.p.slice(0, this.sim.n * CAMPOS); }
   async esperar() {}

@@ -382,13 +382,16 @@ function carregarModelo(nome) {
 
 // ------------------------------------------------------------ interface
 
-let tanqueVazio = false;
+let tanqueVazio = false, tanqueCheio = false;
 function mostrarDica() {
   // a água não fica guardada entre uma visita e outra: tanque vazio ganha instrução
   const vazio = tanqueVazio && !['torneira', 'balde'].includes(estado.ferramenta);
+  const cheio = tanqueCheio && ['torneira', 'balde'].includes(estado.ferramenta);
   const dica = $('#dica');
-  dica.textContent = vazio ? 'Tanque sem água · Torneira (4) ou Balde (5) para pôr, ou um cenário em Montar' : DICAS[estado.ferramenta] ?? '';
-  dica.classList.toggle('dica--vazio', vazio);
+  dica.textContent = vazio ? 'Tanque sem água · Torneira (4) ou Balde (5) para pôr, ou um cenário em Montar'
+    : cheio ? 'Tanque cheio: água nova não entra mais · Esponja (6) para tirar'
+    : DICAS[estado.ferramenta] ?? '';
+  dica.classList.toggle('dica--vazio', vazio || cheio);
 }
 
 function escolherFerramenta(nome) {
@@ -453,14 +456,14 @@ function montarInterface() {
   tam.addEventListener('input', () => { estado.tamanho = Number(tam.value); guardado.gravar('tamanho', estado.tamanho); });
 
   const sel = $('#qualidade');
-  const opcoes = gpu ? ['maximo', 'alto', 'medio', 'leve'] : ['cpu'];
+  const opcoes = gpu ? ['ultra', 'maximo', 'alto', 'medio', 'leve'] : ['cpu'];
   for (const q of opcoes) {
     const o = document.createElement('option');
     o.value = q;
     o.textContent = QUALIDADES[q].nome;
     sel.append(o);
   }
-  if (!opcoes.includes(estado.qualidade)) estado.qualidade = opcoes[Math.min(1, opcoes.length - 1)];
+  if (!opcoes.includes(estado.qualidade)) estado.qualidade = opcoes.includes('alto') ? 'alto' : opcoes[0];
   sel.value = gpu ? estado.qualidade : 'cpu';
   sel.disabled = !gpu;
   sel.addEventListener('change', () => {
@@ -524,16 +527,27 @@ function avisar(texto) {
 
 const SUB_MAX_GPU = 24;
 const SUB_MAX_CPU = 6;
-/** Tempo (ms) que o quadro pode gastar com a física antes de a água começar a andar mais devagar. */
-const ORCAMENTO_MS = 18;
+/**
+ * Tempo (ms) de física que um quadro pode gastar antes de a água começar a
+ * andar mais devagar que o relógio. O custo por subpasso vem do relógio da
+ * própria placa (motor.custoPorSubpasso), não do tempo de fila.
+ */
+const ORCAMENTO_MS = 16;
 let ultimo = performance.now();
 let quadros = 0, marcaQps = performance.now();
-let custoSub = 0.4; // ms por subpasso, média móvel medida
-
+/** Tempo simulado e tempo real desde a última leitura (mostra se está em câmera lenta sem querer). */
+let simulado = 0, decorrido = 0;
+/**
+ * Reserva para placa sem carimbo de tempo (timestamp-query): custo por
+ * subpasso pelo tempo de parede até a fila esvaziar. Mede a disputa com
+ * outros programas junto, mas sem ele um quadro lento pede mais subpassos e
+ * trava tudo em 1 qps.
+ */
+let custoParede = null;
 function registrarCusto(ms, sub) {
   const custo = ms / sub;
   if (sub <= 0 || !Number.isFinite(custo)) return;
-  custoSub += (custo - custoSub) * 0.15;
+  custoParede = custoParede == null ? custo : custoParede + (custo - custoParede) * 0.15;
 }
 
 function quadro(agora) {
@@ -552,14 +566,17 @@ function quadro(agora) {
   // Teto de subpassos pelo que a máquina aguenta: se a placa está ocupada
   // (um jogo aberto, por exemplo), a água anda mais devagar em vez de travar a tela.
   const tetoFixo = motor.tipo === 'gpu' ? SUB_MAX_GPU : SUB_MAX_CPU;
-  const teto = Math.max(2, Math.min(tetoFixo, Math.floor(ORCAMENTO_MS / custoSub)));
+  const custo = motor.custoPorSubpasso ?? custoParede;
+  const teto = custo > 0 ? Math.max(2, Math.min(tetoFixo, Math.floor(ORCAMENTO_MS / custo))) : tetoFixo;
   if (sub > teto) { sub = teto; dt = sub * dtMax; }
   const ferramenta = ferramentaDoQuadro(dt);
   if (cena.atualizar()) motor.paredesMudaram();
   const t0 = performance.now();
   motor.quadro(dt, sub, ferramenta);
-  if (motor.tipo === 'gpu') motor.esperar().then(() => registrarCusto(performance.now() - t0, sub));
-  else registrarCusto(performance.now() - t0, sub);
+  if (motor.tipo === 'gpu' && motor.custoPorSubpasso == null && sub > 0) {
+    motor.esperar().then(() => registrarCusto(performance.now() - t0, sub));
+  }
+  if (!estado.pausado) { simulado += dt; decorrido += real * (estado.lento ? 0.25 : 1); }
   if (motor.tipo === 'gpu') motor.contagem(); // traz a contagem e a maior velocidade, sem esperar
   desenharGuia();
   quadros++;
@@ -567,7 +584,10 @@ function quadro(agora) {
     const qps = (quadros * 1000) / (agora - marcaQps);
     quadros = 0;
     marcaQps = agora;
-    $('#qps').textContent = `${Math.round(qps)} qps`;
+    // Se a placa não der conta, a água anda mais devagar que o relógio: avisa quanto.
+    const ritmo = decorrido > 0.2 ? simulado / decorrido : 1;
+    simulado = 0; decorrido = 0;
+    $('#qps').textContent = ritmo < 0.9 ? `${Math.round(qps)} qps · água a ${fmt1.format(ritmo)}× (placa no limite)` : `${Math.round(qps)} qps`;
     atualizarLeitura();
   }
 }
@@ -579,8 +599,10 @@ async function atualizarLeitura() {
   const litros = (n / PARTICULAS_POR_CELULA) * cena.h * cena.h * PROFUNDIDADE * 1000;
   $('#litros').textContent = `${fmt1.format(litros)} L`;
   $('#particulas').textContent = `${fmt.format(n)} partículas`;
-  if ((n === 0) !== tanqueVazio) {
+  const cheio = n >= motor.maxParticulas * 0.98;
+  if ((n === 0) !== tanqueVazio || cheio !== tanqueCheio) {
     tanqueVazio = n === 0;
+    tanqueCheio = cheio;
     mostrarDica();
   }
 }

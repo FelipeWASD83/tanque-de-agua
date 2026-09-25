@@ -8,10 +8,11 @@ import { semente, particulas, velocidadeMaxima, menorDistanciaAParede } from './
 
 const QUADRO = 1 / 60;
 
+// Mesmo passo adaptativo do app: segue a maior velocidade do quadro anterior.
 function rodar(sim, segundos, aCada) {
-  const sub = Math.ceil(QUADRO / passoMaximo(sim.h, sim.cena.altura));
   const quadros = Math.round(segundos / QUADRO);
   for (let f = 0; f < quadros; f++) {
+    const sub = Math.ceil(QUADRO / passoMaximo(sim.h, sim.cena.altura, sim.vMax ?? null, QUADRO));
     sim.avancar(QUADRO, sub);
     if (aCada) aCada(f * QUADRO);
   }
@@ -27,14 +28,41 @@ function montarModelo(nome, nx, ny, h, aleatorio) {
   return { cena, sim, modelo: m };
 }
 
-test('água parada fica parada', () => {
-  const h = 0.01;
-  const cena = new Cena(60, 40, h);
-  const sim = new SimulacaoCPU(cena);
-  const m = MOLDURA * h;
-  sim.adicionar(semearRetangulo(m, m, 0.6 - m, 0.2, h, [0, 0, 0], semente(3)), false);
-  rodar(sim, 3);
-  assert.ok(velocidadeMaxima(sim) < 0.01, `velocidade máxima ${velocidadeMaxima(sim)} m/s`);
+for (const [nome, tensao, limite] of [['sem tensão superficial', 0, 0.01], ['com tensão superficial', undefined, 0.02]]) {
+  // Com tensão, a curvatura medida nas partículas faz "correntes parasitas" de
+  // ~1 cm/s nesta grade de 1 cm (conhecidas em qualquer método desse tipo).
+  test(`água parada fica parada (${nome})`, () => {
+    const h = 0.01;
+    const cena = new Cena(60, 40, h);
+    const sim = new SimulacaoCPU(cena, { tensao });
+    const m = MOLDURA * h;
+    sim.adicionar(semearRetangulo(m, m, 0.6 - m, 0.2, h, [0, 0, 0], semente(3)), false);
+    rodar(sim, 3);
+    assert.ok(velocidadeMaxima(sim) < limite, `velocidade máxima ${velocidadeMaxima(sim)} m/s`);
+  });
+}
+
+test('sem gravidade, a tensão superficial arredonda uma gota quadrada', () => {
+  const h = 0.002, n = 70;
+  const lado = 32 * h;
+  const centro = (n * h) / 2;
+  const medir = (tensao) => {
+    const cena = new Cena(n, n, h);
+    const sim = new SimulacaoCPU(cena, { gravidade: [0, 0], tensao });
+    sim.adicionar(semearRetangulo(centro - lado / 2, centro - lado / 2, centro + lado / 2, centro + lado / 2, h, [0, 0, 0], semente(8)), false);
+    rodar(sim, 1.2);
+    // num quadrado, o ponto mais longe do centro na diagonal (|dx|+|dy|) vale o
+    // lado; num círculo de mesma área, 0,80 do lado
+    let cx = 0, cy = 0;
+    for (const q of particulas(sim)) { cx += q.x; cy += q.y; }
+    cx /= sim.n; cy /= sim.n;
+    let diagonal = 0;
+    for (const q of particulas(sim)) diagonal = Math.max(diagonal, Math.abs(q.x - cx) + Math.abs(q.y - cy));
+    return diagonal / lado;
+  };
+  const com = medir(undefined), sem = medir(0);
+  assert.ok(sem > 0.93, `sem tensão a gota não devia mudar de forma (${sem.toFixed(2)})`);
+  assert.ok(com < 0.88, `com tensão a gota devia ficar redonda (${com.toFixed(2)}; círculo = 0,80)`);
 });
 
 test('a água despejada no copo não atravessa parede nem some', () => {
@@ -128,4 +156,95 @@ test('a densidade das partículas continua perto da de repouso', () => {
   assert.ok(n > 50, 'quase não sobrou água no miolo');
   const media = soma / n;
   assert.ok(Math.abs(media - PARTICULAS_POR_CELULA) < 0.4, `média de ${media.toFixed(2)} partículas por célula`);
+});
+
+// ------------------------------------------------------------------- ar
+
+function tanqueComBolha(ar) {
+  const h = 0.01;
+  const cena = new Cena(60, 60, h);
+  const sim = new SimulacaoCPU(cena, { ar });
+  const m = MOLDURA * h;
+  const agua = semearRetangulo(m, m, 0.6 - m, 0.45, h, [0, 0, 0], semente(5));
+  const fora = [];
+  for (let k = 0; k < agua.length / 12; k++) {
+    const x = agua[k * 12], y = agua[k * 12 + 1];
+    if ((x - 0.3) ** 2 + (y - 0.12) ** 2 < 0.05 ** 2) continue; // bolha de 5 cm de raio
+    fora.push(...agua.subarray(k * 12, (k + 1) * 12));
+  }
+  sim.adicionar(new Float32Array(fora), false);
+  return sim;
+}
+
+function medirBolhas(sim) {
+  let n = 0, sy = 0;
+  for (let j = 0; j < sim.ny; j++) {
+    for (let i = 0; i < sim.nx; i++) {
+      const c = i + j * sim.nx;
+      if (sim.tipo[c] === 2 && sim.rotulo[c] >= 2) { n++; sy += (j + 0.5) * sim.h; }
+    }
+  }
+  return { celulas: n, altura: n ? sy / n : null };
+}
+
+test('uma bolha de ar no fundo não some: sobe mantendo o volume', () => {
+  const sim = tanqueComBolha(true);
+  rodar(sim, 0.1);
+  const inicio = medirBolhas(sim);
+  rodar(sim, 0.5);
+  const depois = medirBolhas(sim);
+  const v0 = Math.PI * 25; // células (raio de 5 células)
+  assert.ok(inicio.celulas > 0.8 * v0, `bolha encolheu no começo: ${inicio.celulas} de ${v0.toFixed(0)} células`);
+  assert.ok(depois.celulas > 0.75 * v0, `bolha perdeu ar subindo: ${depois.celulas} de ${v0.toFixed(0)} células`);
+  assert.ok(depois.altura - inicio.altura > 0.1, `bolha subiu só ${((depois.altura - inicio.altura) * 100).toFixed(1)} cm em 0,5 s`);
+});
+
+test('montar um cenário por cima de água que já estava lá não perde a bolha', () => {
+  // o mesmo que o botão Montar faz: tira a água, zera o ar e põe a nova
+  const sim = tanqueComBolha(true);
+  const m = MOLDURA * sim.h;
+  const cheio = semearRetangulo(m, m, 0.6 - m, 0.45, sim.h, [0, 0, 0], semente(6));
+  sim.n = 0;
+  sim.contagemCelula.fill(0);
+  sim.reiniciarAr();
+  sim.adicionar(cheio, false);
+  rodar(sim, 0.1); // o tanque todo com água, sem bolha
+  const comBolha = tanqueComBolha(true);
+  const nova = new Float32Array(comBolha.p.subarray(0, comBolha.n * 12));
+  sim.n = 0;
+  sim.contagemCelula.fill(0);
+  sim.reiniciarAr();
+  sim.adicionar(nova, false);
+  rodar(sim, 0.1);
+  const v0 = Math.PI * 25;
+  const { celulas } = medirBolhas(sim);
+  assert.ok(celulas > 0.8 * v0, `a bolha do cenário novo virou vácuo: ${celulas} de ${v0.toFixed(0)} células`);
+});
+
+test('sem o ar, o mesmo buraco vira vácuo e fecha', () => {
+  const sim = tanqueComBolha(false);
+  rodar(sim, 0.3);
+  let vazias = 0;
+  for (let j = 3; j < 25; j++) for (let i = 20; i < 40; i++) if (sim.tipo[i + j * sim.nx] === 2) vazias++;
+  assert.ok(vazias < 10, `${vazias} células vazias onde era o buraco`);
+});
+
+test('a ampulheta com ar esvazia bem mais devagar do que sem ar', () => {
+  const emCima = (ar) => {
+    const h = 0.01;
+    const cena = new Cena(60, 90, h);
+    const m = MODELOS.ampulheta.montar(cena.largura, cena.altura, h);
+    for (const t of m.tracos) cena.tracar(t.x0, t.y0, t.x1, t.y1, t.raio);
+    cena.atualizar();
+    const sim = new SimulacaoCPU(cena, { ar });
+    for (const a of m.agua) sim.adicionar(semearAgua(a, h, [0, 0, 0], semente(2)), false);
+    const n0 = sim.n;
+    rodar(sim, 1);
+    let cima = 0;
+    for (const q of particulas(sim)) if (q.y > cena.altura / 2) cima++;
+    return cima / n0;
+  };
+  const com = emCima(true), sem = emCima(false);
+  assert.ok(sem < 0.1, `sem ar, depois de 1 s ainda sobrava ${(sem * 100).toFixed(0)}% em cima`);
+  assert.ok(com > 0.4, `com ar, depois de 1 s só sobrava ${(com * 100).toFixed(0)}% em cima (o ar de baixo tinha que segurar)`);
 });

@@ -7,12 +7,17 @@
 //   1. partículas → grade (APIC): velocidade nas faces, densidade nas células
 //   2. gravidade nas faces com água
 //   3. classifica as células (parede / água / ar) e zera as faces de parede
-//   4. pressão: deixa a água incompressível (e desfaz compressão acumulada)
+//   4. pressão (MGPCG, pressao-cpu.js): deixa a água incompressível e desfaz
+//      compressão acumulada
 //   5. aplica o gradiente de pressão e estende a velocidade para o ar
 //   6. grade → partículas (APIC), anda, bate na parede
 
+import { montarNiveis, resolverPCG } from './pressao-cpu.js';
+import { RastreadorDeAr } from './ar.js';
 import {
-  GRAVIDADE, PARTICULAS_POR_CELULA, TAU_DENSIDADE, ITERACOES_PRESSAO, OMEGA,
+  GRAVIDADE, PARTICULAS_POR_CELULA, TAU_DENSIDADE, ITERACOES_PCG, EXCESSO_MIN, EXCESSO_MAX,
+  DENSIDADE_AGUA, TENSAO_SUPERFICIAL, MAX_BOLHAS, VOLTA_VOLUME_BOLHA, PRESSAO_BOLHA_MAX,
+  MICROPASSO, MAX_MICROPASSOS,
   CAMADAS_EXTRAPOLACAO, RAIO_PARTICULA, SDF_MAX, ESPUMA_V0, ESPUMA_V1, ESPUMA_TAXA, ESPUMA_VIDA, DIFUSAO_CORANTE,
 } from './constantes.js';
 
@@ -27,8 +32,9 @@ export class SimulacaoCPU {
     this.ny = cena.ny;
     this.h = cena.h;
     this.gravidade = opcoes.gravidade ?? [0, -GRAVIDADE];
-    this.iteracoes = opcoes.iteracoes ?? ITERACOES_PRESSAO;
+    this.iteracoes = opcoes.iteracoes ?? ITERACOES_PCG;
     this.tauDensidade = opcoes.tauDensidade ?? TAU_DENSIDADE;
+    this.tensao = opcoes.tensao ?? TENSAO_SUPERFICIAL;
     const nx = this.nx, ny = this.ny;
     this.nu = (nx + 1) * ny;
     this.nv = nx * (ny + 1);
@@ -47,6 +53,22 @@ export class SimulacaoCPU {
     this.solidoCelula = new Uint8Array(nx * ny);
     this.div = new Float32Array(nx * ny);
     this.q = new Float32Array(nx * ny);
+    // superfície: fração de água suavizada, normal, curvatura e pressão das células de ar
+    this.fase = new Float32Array(nx * ny);
+    this.faseTmp = new Float32Array(nx * ny);
+    this.normalX = new Float32Array(nx * ny);
+    this.normalY = new Float32Array(nx * ny);
+    this.curvatura = new Float32Array(nx * ny);
+    this.qAr = new Float32Array(nx * ny);
+    // ar: bolsões fechados guardam o volume (ar.js); pressão manométrica (Pa) por rótulo
+    this.arAtivo = opcoes.ar ?? true;
+    this.rastreador = new RastreadorDeAr(nx, ny);
+    this.rotulo = this.rastreador.rotulo;
+    this.pressaoBolha = new Float32Array(MAX_BOLHAS);
+    this.volumeBolha = new Float32Array(MAX_BOLHAS);
+    this.rhsBolha = new Float32Array(MAX_BOLHAS);
+    this.yBolha = new Float32Array(MAX_BOLHAS);
+    this.niveis = montarNiveis(nx, ny);
     this.capacidade = 0;
     this.n = 0;
     this.p = new Float32Array(0);
@@ -131,15 +153,36 @@ export class SimulacaoCPU {
 
   /** Avança dt segundos em n subpassos iguais. */
   avancar(dt, subpassos = 1) {
+    if (this.arAtivo) this.atualizarAr();
     const d = dt / subpassos;
     for (let s = 0; s < subpassos; s++) this.subpasso(d);
+  }
+
+  /** Refaz os bolsões de ar a partir dos tipos atuais (uma vez por quadro). */
+  atualizarAr() {
+    // antes do primeiro subpasso os tipos ainda não existem: calcula agora
+    if (!this.tiposProntos) { this.#paraGrade(); this.#tipos(); }
+    const { nascidas } = this.rastreador.atualizar(this.tipo, (r) => this.pressaoBolha[r]);
+    for (const [r, p] of nascidas) this.pressaoBolha[r] = p;
+  }
+
+  /** Cenário novo: o ar fechado que existir vira bolha com o volume que tiver. */
+  reiniciarAr() {
+    this.tiposProntos = false; // a primeira leitura tem que ver a água nova, não a do cenário anterior
+    this.rastreador.reiniciar();
+    this.pressaoBolha.fill(0);
   }
 
   subpasso(dt) {
     this.#paraGrade();
     this.#gravidadeEFronteira(dt);
+    this.#tipos();
+    if (this.arAtivo) this.#propagarRotulos();
+    this.#superficie();
+    this.#pressaoDoAr(dt);
     this.#classificar(dt);
-    this.#pressao();
+    if (this.arAtivo) this.#ladoDireitoDasBolhas(dt);
+    this.#pressao(dt);
     this.#gradiente();
     this.#extrapolar();
     this.#paraParticulas(dt);
@@ -247,16 +290,176 @@ export class SimulacaoCPU {
     }
   }
 
+  #tipos() {
+    this.tiposProntos = true;
+    const n = this.nx * this.ny;
+    for (let c = 0; c < n; c++) {
+      this.tipo[c] = this.solidoCelula[c] ? SOLIDO : this.contagemCelula[c] > 0 ? AGUA : AR;
+    }
+  }
+
+  /**
+   * Curvatura da superfície: fração de água por célula, suavizada duas vezes
+   * (a parede copia a média dos vizinhos livres: ângulo de contato de 90°),
+   * normal pelo gradiente e κ = −div(normal).
+   */
+  #superficie() {
+    const { nx, ny, h, tipo } = this;
+    const f = this.fase, t = this.faseTmp;
+    for (let c = 0; c < nx * ny; c++) f[c] = tipo[c] === SOLIDO ? 0 : Math.min(1, this.densidade[c] / PARTICULAS_POR_CELULA);
+    const passadas = 2;
+    for (let passada = 0; passada <= passadas; passada++) {
+      this.#estenderNaParede(f);
+      if (passada === passadas) break;
+      // borrão 3×3 (1 2 1), separável
+      for (let j = 0; j < ny; j++) {
+        for (let i = 0; i < nx; i++) {
+          const c = i + j * nx;
+          const im = i > 0 ? c - 1 : c, ip = i < nx - 1 ? c + 1 : c;
+          t[c] = (f[im] + 2 * f[c] + f[ip]) * 0.25;
+        }
+      }
+      for (let j = 0; j < ny; j++) {
+        for (let i = 0; i < nx; i++) {
+          const c = i + j * nx;
+          const jm = j > 0 ? c - nx : c, jp = j < ny - 1 ? c + nx : c;
+          f[c] = (t[jm] + 2 * t[c] + t[jp]) * 0.25;
+        }
+      }
+    }
+    const nX = this.normalX, nY = this.normalY, kap = this.curvatura;
+    for (let j = 1; j < ny - 1; j++) {
+      for (let i = 1; i < nx - 1; i++) {
+        const c = i + j * nx;
+        const gx = (f[c + 1] - f[c - 1]) * 0.5, gy = (f[c + nx] - f[c - nx]) * 0.5;
+        const g = Math.hypot(gx, gy);
+        nX[c] = g > 1e-3 ? gx / g : 0;
+        nY[c] = g > 1e-3 ? gy / g : 0;
+      }
+    }
+    for (let j = 1; j < ny - 1; j++) {
+      for (let i = 1; i < nx - 1; i++) {
+        const c = i + j * nx;
+        kap[c] = -((nX[c + 1] - nX[c - 1]) + (nY[c + nx] - nY[c - nx])) / (2 * h);
+      }
+    }
+  }
+
+  /**
+   * Estende a fração de água para dentro da parede, camada por camada (cada
+   * célula de parede copia a média das vizinhas já preenchidas). É um espelho:
+   * superfície plana encostando na parede continua plana (ângulo de 90°).
+   */
+  #estenderNaParede(f) {
+    const { nx, ny, tipo } = this;
+    const cheio = this.preenchido ??= new Uint8Array(nx * ny);
+    for (let c = 0; c < nx * ny; c++) cheio[c] = tipo[c] === SOLIDO ? 0 : 1;
+    const novas = this.novas ??= new Int32Array(nx * ny);
+    for (let camada = 0; camada < 3; camada++) {
+      let n = 0;
+      for (let j = 0; j < ny; j++) {
+        for (let i = 0; i < nx; i++) {
+          const c = i + j * nx;
+          if (cheio[c]) continue;
+          let s = 0, k = 0;
+          if (i > 0 && cheio[c - 1]) { s += f[c - 1]; k++; }
+          if (i < nx - 1 && cheio[c + 1]) { s += f[c + 1]; k++; }
+          if (j > 0 && cheio[c - nx]) { s += f[c - nx]; k++; }
+          if (j < ny - 1 && cheio[c + nx]) { s += f[c + nx]; k++; }
+          if (k) { this.faseTmp[c] = s / k; novas[n++] = c; }
+        }
+      }
+      for (let q = 0; q < n; q++) { const c = novas[q]; f[c] = this.faseTmp[c]; cheio[c] = 1; }
+    }
+  }
+
+  /**
+   * Pressão das células de ar, em unidades de q (p·dt/(ρh)): o salto da
+   * tensão superficial σ·κ onde o ar encosta na água. A pressão própria de
+   * cada bolha fechada sai do solver (#pressao) e é somada depois.
+   */
+  #pressaoDoAr(dt) {
+    const { nx, ny, h, tipo } = this;
+    const escala = dt / (DENSIDADE_AGUA * h);
+    const kMax = 1 / h;
+    this.qAr.fill(0);
+    for (let j = 1; j < ny - 1; j++) {
+      for (let i = 1; i < nx - 1; i++) {
+        const c = i + j * nx;
+        if (tipo[c] !== AR) continue;
+        let p = 0;
+        if (this.tensao > 0) {
+          // curvatura média entre a célula de ar e as vizinhas com água
+          let s = this.curvatura[c], k = 1;
+          if (tipo[c - 1] === AGUA) { s += this.curvatura[c - 1]; k++; }
+          if (tipo[c + 1] === AGUA) { s += this.curvatura[c + 1]; k++; }
+          if (tipo[c - nx] === AGUA) { s += this.curvatura[c - nx]; k++; }
+          if (tipo[c + nx] === AGUA) { s += this.curvatura[c + nx]; k++; }
+          if (k > 1) p += this.tensao * Math.max(-kMax, Math.min(kMax, s / k));
+        }
+        this.qAr[c] = p * escala;
+      }
+    }
+  }
+
+  /**
+   * Célula que virou ar depois da última leitura (a bolha andou) pega o rótulo
+   * de uma vizinha de ar; célula que virou água perde o rótulo.
+   */
+  #propagarRotulos() {
+    const { nx, ny, tipo } = this;
+    const rot = this.rotulo;
+    for (let c = 0; c < nx * ny; c++) if (tipo[c] !== AR) rot[c] = 0;
+    for (let passada = 0; passada < 2; passada++) {
+      for (let j = 1; j < ny - 1; j++) {
+        for (let i = 1; i < nx - 1; i++) {
+          const c = i + j * nx;
+          if (tipo[c] !== AR || rot[c]) continue;
+          rot[c] = rot[c - 1] || rot[c + 1] || rot[c - nx] || rot[c + nx];
+        }
+      }
+    }
+  }
+
+  /**
+   * Lado direito de cada bolha no solver: a água que está entrando nela agora
+   * (antes da projeção), mais o volume que ela perdeu por erro numérico (volta
+   * aos poucos), menos a tensão superficial das faces.
+   */
+  #ladoDireitoDasBolhas(dt) {
+    const { nx, ny, h, tipo, u, v } = this;
+    const rot = this.rotulo;
+    const rhs = this.rhsBolha, vol = this.volumeBolha;
+    rhs.fill(0); vol.fill(0);
+    for (let j = 1; j < ny - 1; j++) {
+      for (let i = 1; i < nx - 1; i++) {
+        const c = i + j * nx;
+        const r = rot[c];
+        if (tipo[c] !== AR || r < 2) continue;
+        vol[r]++;
+        const t = this.qAr[c];
+        if (tipo[c - 1] === AGUA) rhs[r] += u[i + j * (nx + 1)] - t;
+        if (tipo[c + 1] === AGUA) rhs[r] += -u[i + 1 + j * (nx + 1)] - t;
+        if (tipo[c - nx] === AGUA) rhs[r] += v[i + j * nx] - t;
+        if (tipo[c + nx] === AGUA) rhs[r] += -v[i + (j + 1) * nx] - t;
+      }
+    }
+    const alvo = this.rastreador.volumeAlvo;
+    const paraQ = dt / (DENSIDADE_AGUA * h);
+    for (let r = 2; r < MAX_BOLHAS; r++) {
+      if (!vol[r]) continue;
+      rhs[r] += VOLTA_VOLUME_BOLHA * (alvo[r] - vol[r]) * h / dt;
+      this.yBolha[r] = this.pressaoBolha[r] * paraQ; // chute inicial
+    }
+  }
+
   #classificar(dt) {
-    const { nx, ny, h } = this;
+    const { nx, ny, h, tipo } = this;
     const alvo = h / Math.max(this.tauDensidade, dt); // velocidade que desfaz a compressão em tau segundos
     for (let j = 0; j < ny; j++) {
       for (let i = 0; i < nx; i++) {
         const c = i + j * nx;
-        let t = AR;
-        if (this.solidoCelula[c]) t = SOLIDO;
-        else if (this.contagemCelula[c] > 0) t = AGUA;
-        this.tipo[c] = t;
+        const t = tipo[c];
         if (t !== AGUA) { this.div[c] = 0; this.q[c] = 0; continue; }
         const d = this.u[i + 1 + j * (nx + 1)] - this.u[i + j * (nx + 1)] +
           this.v[i + (j + 1) * nx] - this.v[i + j * nx];
@@ -264,8 +467,16 @@ export class SimulacaoCPU {
         // Rarefeita só conta no miolo da água: perto do ar e da parede a
         // densidade medida é naturalmente menor (falta vizinho de um lado).
         if (excesso < 0 && !this.#miolo(i, j)) excesso = 0;
+        // limitado: partícula muito amontoada não pode virar um jato que realimenta o caos
+        excesso = Math.min(EXCESSO_MAX, Math.max(EXCESSO_MIN, excesso));
+        // Ar vizinho com pressão própria entra como valor conhecido (vai para o lado direito).
+        let ar = 0;
+        if (tipo[c - 1] === AR) ar += this.qAr[c - 1];
+        if (tipo[c + 1] === AR) ar += this.qAr[c + 1];
+        if (tipo[c - nx] === AR) ar += this.qAr[c - nx];
+        if (tipo[c + nx] === AR) ar += this.qAr[c + nx];
         // O que a pressão precisa desfazer: a divergência atual menos a expansão desejada.
-        this.div[c] = d - alvo * excesso;
+        this.div[c] = d - alvo * excesso - ar;
       }
     }
   }
@@ -284,23 +495,21 @@ export class SimulacaoCPU {
 
   // ------------------------------------------------------------ 4. pressão
 
-  #pressao() {
-    const { nx, ny, tipo, q, div } = this;
-    for (let it = 0; it < this.iteracoes; it++) {
-      for (let cor = 0; cor < 2; cor++) {
-        for (let j = 1; j < ny - 1; j++) {
-          for (let i = 1 + ((j + cor) & 1); i < nx - 1; i += 2) {
-            const c = i + j * nx;
-            if (tipo[c] !== AGUA) continue;
-            let soma = 0, n = 0;
-            let t = tipo[c - 1]; if (t !== SOLIDO) { n++; soma += q[c - 1]; }
-            t = tipo[c + 1]; if (t !== SOLIDO) { n++; soma += q[c + 1]; }
-            t = tipo[c - nx]; if (t !== SOLIDO) { n++; soma += q[c - nx]; }
-            t = tipo[c + nx]; if (t !== SOLIDO) { n++; soma += q[c + nx]; }
-            const novo = n > 0 ? (soma - div[c]) / n : 0;
-            q[c] += OMEGA * (novo - q[c]);
-          }
-        }
+  #pressao(dt) {
+    // o mesmo solver da GPU (MGPCG), partindo da pressão do subpasso anterior;
+    // cada bolha fechada é uma incógnita a mais
+    const bolhas = this.arAtivo ? { rotulo: this.rotulo, rhs: this.rhsBolha, y: this.yBolha } : null;
+    resolverPCG(this.niveis, this.tipo, this.div, this.q, this.iteracoes, bolhas);
+    // pressão das células de ar: tensão superficial + a da bolha (se for bolha)
+    const paraPa = (DENSIDADE_AGUA * this.h) / dt;
+    for (let c = 0; c < this.q.length; c++) {
+      if (this.tipo[c] !== AR) continue;
+      const r = this.rotulo[c];
+      this.q[c] = this.qAr[c] + (bolhas && r >= 2 && this.volumeBolha[r] ? this.yBolha[r] : 0);
+    }
+    if (bolhas) {
+      for (let r = 2; r < MAX_BOLHAS; r++) {
+        if (this.volumeBolha[r]) this.pressaoBolha[r] = Math.max(-PRESSAO_BOLHA_MAX, Math.min(PRESSAO_BOLHA_MAX, this.yBolha[r] * paraPa));
       }
     }
   }
@@ -347,7 +556,7 @@ export class SimulacaoCPU {
   #paraParticulas(dt) {
     const { nx, ny, h, p, cena } = this;
     const inv = 1 / h;
-    const vmax = (0.95 * h) / dt; // não deixa andar mais de uma célula por subpasso
+    const vmax = (MICROPASSO * MAX_MICROPASSOS * h) / dt; // teto: todos os micro-passos cheios
     const decai = Math.exp(-dt / ESPUMA_VIDA);
     const mistura = Math.min(1, dt / DIFUSAO_CORANTE);
     let mortas = false;
@@ -399,25 +608,56 @@ export class SimulacaoCPU {
 
       if (vel > vmax) { vx *= vmax / vel; vy *= vmax / vel; }
       if (vel > maior) maior = vel;
-      x += vx * dt;
-      y += vy * dt;
-
-      const d = cena.distancia(x, y);
-      if (d < RAIO_PARTICULA) {
-        if (d < -SDF_MAX + 0.5) { p[o] = NaN; mortas = true; continue; }
-        const [nX, nY] = cena.normal(x, y);
-        const empurra = (RAIO_PARTICULA - d) * h;
-        x += nX * empurra;
-        y += nY * empurra;
-        const vn = vx * nX + vy * nY;
-        if (vn < 0) { vx -= vn * nX; vy -= vn * nY; }
+      // anda em micro-passos pela velocidade da grade, batendo na parede a cada um
+      const micro = Math.min(MAX_MICROPASSOS, Math.max(1, Math.ceil((Math.min(vel, vmax) * dt) / (MICROPASSO * h))));
+      const dm = dt / micro;
+      let morta = false;
+      for (let m = 0; m < micro; m++) {
+        let wx = vx, wy = vy;
+        if (micro > 1) [wx, wy] = this.#velocidadeEm(x, y, vmax);
+        x += wx * dm;
+        y += wy * dm;
+        const d = cena.distancia(x, y);
+        if (d < RAIO_PARTICULA) {
+          if (d < -SDF_MAX + 0.5) { morta = true; break; }
+          const [nX, nY] = cena.normal(x, y);
+          const empurra = (RAIO_PARTICULA - d) * h;
+          x += nX * empurra;
+          y += nY * empurra;
+          const vn = vx * nX + vy * nY;
+          if (vn < 0) { vx -= vn * nX; vy -= vn * nY; }
+        }
       }
+      if (morta) { p[o] = NaN; mortas = true; continue; }
       p[o] = x; p[o + 1] = y; p[o + 2] = vx; p[o + 3] = vy;
       p[o + 4] = cux; p[o + 5] = cuy; p[o + 6] = cvx; p[o + 7] = cvy;
       p[o + 8] = espuma;
     }
     if (mortas) this.remover((x) => Number.isNaN(x));
     this.vMax = maior;
+  }
+
+  /** Velocidade da grade (já projetada) na posição, interpolada; limitada a vmax. */
+  #velocidadeEm(x, y, vmax) {
+    const { nx, ny, h } = this;
+    const inv = 1 / h;
+    let vx = 0, vy = 0;
+    {
+      const fx = x * inv, fy = y * inv - 0.5;
+      const i0 = clampi(Math.floor(fx), 0, nx - 1), j0 = clampi(Math.floor(fy), 0, ny - 2);
+      const tx = fx - i0, ty = fy - j0;
+      const k = i0 + j0 * (nx + 1);
+      vx = (this.u[k] * (1 - tx) + this.u[k + 1] * tx) * (1 - ty) + (this.u[k + nx + 1] * (1 - tx) + this.u[k + nx + 2] * tx) * ty;
+    }
+    {
+      const fx = x * inv - 0.5, fy = y * inv;
+      const i0 = clampi(Math.floor(fx), 0, nx - 2), j0 = clampi(Math.floor(fy), 0, ny - 1);
+      const tx = fx - i0, ty = fy - j0;
+      const k = i0 + j0 * nx;
+      vy = (this.v[k] * (1 - tx) + this.v[k + 1] * tx) * (1 - ty) + (this.v[k + nx] * (1 - tx) + this.v[k + nx + 1] * tx) * ty;
+    }
+    const v = Math.hypot(vx, vy);
+    return v > vmax ? [vx * vmax / v, vy * vmax / v] : [vx, vy];
   }
 
   #garantir(n) {

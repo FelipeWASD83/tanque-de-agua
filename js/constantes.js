@@ -7,6 +7,36 @@ export const METROS_POR_PX = 1 / 1440;
 /** Aceleração da gravidade, em m/s². */
 export const GRAVIDADE = 9.81;
 
+/** Densidade da água, em kg/m³. */
+export const DENSIDADE_AGUA = 1000;
+
+/**
+ * Tensão superficial da água com o ar, em N/m (0,0728 a 20 °C). Entra como um
+ * salto de pressão σ·κ na superfície (κ = curvatura). Num tanque de 1 m ela só
+ * aparece em gota e filete de poucos milímetros — como na água de verdade.
+ */
+export const TENSAO_SUPERFICIAL = 0.0728;
+/** Quantos bolsões de ar fechados a simulação acompanha ao mesmo tempo. */
+export const MAX_BOLHAS = 4096;
+
+/**
+ * Bolhas: cada bolha fechada é uma incógnita a mais no solver de pressão (o ar
+ * não entra nem sai, então a água só ocupa o lugar dele se ele escapar).
+ * VOLTA_VOLUME_BOLHA é quanto do volume perdido por erro numérico a bolha
+ * recupera por subpasso; PRESSAO_BOLHA_MAX (Pa) é um teto de segurança
+ * (2 m de coluna d'água).
+ */
+export const VOLTA_VOLUME_BOLHA = 0.05;
+export const PRESSAO_BOLHA_MAX = 20000;
+
+/**
+ * Fração do passo capilar clássico que fica estável (medido: 0,5 estável em
+ * grade de 2,3 mm na GPU; na de 4 mm a instabilidade começa perto de 0,45).
+ */
+export const FATOR_CAPILAR = 0.4;
+/** Teto absoluto do subpasso (s): nas grades grossas o limite capilar sozinho deixa o passo grande demais. */
+export const PASSO_MAX = 0.008;
+
 /** Profundidade do tanque (entrando na tela), em metros. Só entra na conta dos litros. */
 export const PROFUNDIDADE = 0.05;
 
@@ -25,8 +55,17 @@ export const MOLDURA = 2;
 /** Raio de colisão da partícula com a parede, em células. */
 export const RAIO_PARTICULA = 0.3;
 
-/** Número de Courant: quantas células uma partícula pode andar por subpasso. */
-export const CFL = 1.0;
+/**
+ * Número de Courant: quantas células a água pode andar por subpasso. Acima de
+ * 1, a partícula anda em micro-passos (no máximo MICROPASSO células cada)
+ * pelo campo de velocidade já projetado, batendo na parede a cada um — segue
+ * a correnteza sem atravessar parede fina, e a pressão (a parte cara) roda
+ * menos vezes.
+ */
+export const CFL = 2.0;
+export const MICROPASSO = 0.8;
+/** Teto de micro-passos por subpasso (e, com ele, da velocidade: MICROPASSO·MAX_MICROPASSOS células por subpasso). */
+export const MAX_MICROPASSOS = 4;
 
 /**
  * Correção de densidade: partícula que se amontoa (ou se espalha no miolo da
@@ -36,9 +75,10 @@ export const CFL = 1.0;
  * parava quieta).
  */
 export const TAU_DENSIDADE = 0.1;
+/** Limites do excesso de densidade que a correção aceita (fração da densidade de repouso). */
+export const EXCESSO_MIN = -0.5;
+export const EXCESSO_MAX = 1.0;
 
-/** Iterações do solver de pressão (Gauss-Seidel vermelho-preto) por subpasso, na CPU. */
-export const ITERACOES_PRESSAO = 40;
 /**
  * Na GPU a pressão é resolvida por gradiente conjugado pré-condicionado com
  * multigrid (gpu/pcg.js): iterações por subpasso, partindo da pressão do
@@ -46,8 +86,6 @@ export const ITERACOES_PRESSAO = 40;
  */
 export const ITERACOES_PCG = 3;
 
-/** Relaxação do solver (SOR). */
-export const OMEGA = 1.7;
 
 /** Camadas de extrapolação da velocidade para o ar. */
 export const CAMADAS_EXTRAPOLACAO = 2;
@@ -67,6 +105,7 @@ export const ESPUMA_VIDA = 1.2;
 
 /** Qualidades: quantas células a grade tenta ter, e o menor tamanho de célula (m). */
 export const QUALIDADES = {
+  ultra:  { nome: 'Ultra',  celulas: 450_000, hMin: 0.0016 },
   maximo: { nome: 'Máximo', celulas: 220_000, hMin: 0.0022 },
   alto:   { nome: 'Alto',   celulas: 130_000, hMin: 0.0026 },
   medio:  { nome: 'Médio',  celulas: 70_000,  hMin: 0.0032 },
@@ -86,8 +125,11 @@ export const RAIO_MANCHA = 2.1;
  */
 export const DIFUSAO_CORANTE = 3;
 
-/** Teto de partículas por célula de grade (reserva de memória na GPU). */
-export const PARTICULAS_MAX_POR_CELULA = 2.6;
+/**
+ * Teto de partículas por célula de grade (reserva de memória na GPU). Com 4 por
+ * célula de água, 4,6 deixa encher o tanque inteiro com folga para respingo.
+ */
+export const PARTICULAS_MAX_POR_CELULA = 4.6;
 
 /**
  * Corantes: absorção (por metro de água atravessada) em R, G, B.
@@ -125,7 +167,11 @@ export function dimensoesDaGrade(larguraM, alturaM, qualidade) {
 export function passoMaximo(h, alturaM, vMax = null, dtQuadro = 1 / 60) {
   const queda = Math.sqrt(2 * GRAVIDADE * alturaM) * 1.15 + 0.5;
   const v = vMax == null ? queda : Math.min(queda, vMax * 1.2 + GRAVIDADE * dtQuadro + 0.25);
-  return (CFL * h) / Math.max(v, 0.3);
+  // Onda capilar: a tensão superficial explícita só fica estável abaixo deste
+  // passo. A conta clássica (√(ρh³/2πσ)) é otimista para curvatura medida a
+  // partir de partículas; medido, o limite real é uns 40% dela.
+  const capilar = FATOR_CAPILAR * Math.sqrt((DENSIDADE_AGUA * h * h * h) / (2 * Math.PI * TENSAO_SUPERFICIAL));
+  return Math.min((CFL * h) / Math.max(v, 0.3), capilar, PASSO_MAX);
 }
 
 /** Raio do pincel de parede, em células: o mínimo impede parede fina demais (que vaza). */
