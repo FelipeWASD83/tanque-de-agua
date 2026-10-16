@@ -79,3 +79,7 @@ do tanque é a atmosfera e sai livre.
 tanque ela é sutil, como na vida: arredonda gota pequena, filete fino e ponta
 de respingo, mas não segura um bloco de água parado no ar. Numa gota de 1 cm
 dá para ver; num balde, não.
+
+## Licença
+
+Código sob a licença MIT (arquivo `LICENSE`).
